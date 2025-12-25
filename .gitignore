@@ -5,7 +5,7 @@ node_modules/
 repos/
 public/boards/
 public/*.json
-
+static-server.js
 # 日志
 *.log
 verdaccio.log
