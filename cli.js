@@ -285,23 +285,46 @@ function startVerdaccio() {
     } else {
         console.log('正在启动 Verdaccio 后台服务...');
 
-        const out = fs.openSync(logFile, 'a');
-        const err = fs.openSync(logFile, 'a');
+        // 使用 wscript 运行 VBS 脚本来启动隐藏窗口的进程
+        const vbsScript = path.join(__dirname, '.start-verdaccio.vbs');
+        const vbsContent = `Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """${verdaccioBin.replace(/\\/g, '\\\\')}""" & " --config " & """${configPath.replace(/\\/g, '\\\\')}""", 0, False
+`;
+        fs.writeFileSync(vbsScript, vbsContent);
 
-        const child = spawn(verdaccioBin, ['--config', configPath], {
-            detached: true,
-            stdio: ['ignore', out, err],
-            shell: true
-        });
-
-        child.unref();
-
-        // 保存 PID
-        fs.writeFileSync(pidFile, child.pid.toString());
-
-        console.log(`Verdaccio 后台服务已启动 (PID: ${child.pid})`);
-        console.log(`日志文件: ${logFile}`);
-        console.log(`访问地址: http://localhost:4873`);
+        try {
+            execSync(`cscript //nologo "${vbsScript}"`, { 
+                encoding: 'utf8',
+                windowsHide: true 
+            });
+            
+            // 等待一下让进程启动
+            execSync('ping 127.0.0.1 -n 2 > nul', { shell: true, windowsHide: true });
+            
+            // 通过 PowerShell 查找 verdaccio 进程的 PID
+            const psCmd = `powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*verdaccio*' -and $_.CommandLine -like '*config.yaml*' } | Select-Object -First 1 -ExpandProperty ProcessId"`;
+            const result = execSync(psCmd, {
+                encoding: 'utf8',
+                windowsHide: true
+            }).trim();
+            
+            if (result && !isNaN(parseInt(result, 10))) {
+                const pid = parseInt(result, 10);
+                fs.writeFileSync(pidFile, pid.toString());
+                console.log(`Verdaccio 后台服务已启动 (PID: ${pid})`);
+                console.log(`日志文件: ${logFile}`);
+                console.log(`访问地址: http://localhost:4873`);
+            } else {
+                console.log('Verdaccio 后台服务已启动（无法获取 PID）');
+                console.log(`访问地址: http://localhost:4873`);
+            }
+            
+            // 删除临时 VBS 文件
+            fs.unlinkSync(vbsScript);
+        } catch (e) {
+            console.error('启动 Verdaccio 失败:', e.message);
+            if (fs.existsSync(vbsScript)) fs.unlinkSync(vbsScript);
+        }
     }
 
     // 启动静态文件服务器
@@ -422,23 +445,44 @@ server.listen(port, () => {
 
     fs.writeFileSync(staticServerScript, scriptContent);
 
-    const out = fs.openSync(staticLogFile, 'a');
-    const err = fs.openSync(staticLogFile, 'a');
+    // 使用 wscript 运行 VBS 脚本来启动隐藏窗口的进程
+    const vbsScript = path.join(__dirname, '.start-static.vbs');
+    const vbsContent = `Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "node ""${staticServerScript.replace(/\\/g, '\\\\')}""", 0, False
+`;
+    fs.writeFileSync(vbsScript, vbsContent);
 
-    const child = spawn('node', [staticServerScript], {
-        detached: true,
-        stdio: ['ignore', out, err],
-        shell: true
-    });
-
-    child.unref();
-
-    // 保存 PID
-    fs.writeFileSync(staticPidFile, child.pid.toString());
-
-    console.log(`静态文件服务器已启动 (PID: ${child.pid})`);
-    console.log(`日志文件: ${staticLogFile}`);
-    console.log(`访问地址: http://localhost:${STATIC_SERVER_PORT}`);
+    try {
+        execSync(`cscript //nologo "${vbsScript}"`, { 
+            encoding: 'utf8',
+            windowsHide: true 
+        });
+        
+        // 等待一下让进程启动
+        execSync('ping 127.0.0.1 -n 2 > nul', { shell: true, windowsHide: true });
+        
+        // 通过 PowerShell 查找 node 进程的 PID
+        const psCmd = `powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*static-server.js*' -and $_.Name -eq 'node.exe' } | Select-Object -First 1 -ExpandProperty ProcessId"`;
+        const result = execSync(psCmd, {
+            encoding: 'utf8',
+            windowsHide: true
+        }).trim();
+        
+        if (result && !isNaN(parseInt(result, 10))) {
+            const pid = parseInt(result, 10);
+            fs.writeFileSync(staticPidFile, pid.toString());
+            console.log(`静态文件服务器已启动 (PID: ${pid})`);
+            console.log(`访问地址: http://localhost:${STATIC_SERVER_PORT}`);
+        } else {
+            console.log('静态文件服务器已启动（无法获取 PID）');
+        }
+        
+        // 删除临时 VBS 文件
+        fs.unlinkSync(vbsScript);
+    } catch (e) {
+        console.error('启动静态文件服务器失败:', e.message);
+        if (fs.existsSync(vbsScript)) fs.unlinkSync(vbsScript);
+    }
 }
 
 function stopVerdaccio() {
