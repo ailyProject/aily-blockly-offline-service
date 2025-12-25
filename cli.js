@@ -12,7 +12,6 @@ const pidFile = path.join(__dirname, '.verdaccio.pid');
 const staticPidFile = path.join(__dirname, '.static-server.pid');
 const reposDir = path.join(__dirname, 'repos');
 const publicDir = path.join(__dirname, 'public');
-const envFile = path.join(__dirname, '.env');
 const STATIC_SERVER_PORT = 4874;
 
 // 默认用户信息
@@ -22,41 +21,6 @@ const DEFAULT_USER = {
     email: 'admin@aily.local'
 };
 
-/**
- * 读取 .env 文件
- */
-function loadEnv() {
-    if (!fs.existsSync(envFile)) {
-        return {};
-    }
-    const content = fs.readFileSync(envFile, 'utf8');
-    const env = {};
-    content.split('\n').forEach(line => {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#')) {
-            const [key, ...valueParts] = trimmed.split('=');
-            if (key) {
-                env[key.trim()] = valueParts.join('=').trim();
-            }
-        }
-    });
-    return env;
-}
-
-/**
- * 保存用户信息到 .env 文件
- */
-function saveEnv(userInfo) {
-    const content = `# Verdaccio 用户信息 (自动生成)
-NPM_USER=${userInfo.username}
-NPM_PASS=${userInfo.password}
-NPM_EMAIL=${userInfo.email}
-NPM_REGISTRY=http://localhost:4873
-${userInfo.token ? `NPM_TOKEN=${userInfo.token}` : ''}
-`;
-    fs.writeFileSync(envFile, content, 'utf8');
-    console.log(`用户信息已保存到 ${envFile}`);
-}
 
 /**
  * 等待 verdaccio 启动
@@ -67,9 +31,12 @@ function waitForVerdaccio(maxRetries = 30, interval = 1000) {
 
         const check = () => {
             const req = http.get('http://localhost:4873/-/ping', (res) => {
+                res.resume(); // 消费响应数据
                 if (res.statusCode === 200) {
+                    res.destroy(); // 销毁连接
                     resolve();
                 } else {
+                    res.destroy();
                     retry();
                 }
             });
@@ -98,108 +65,127 @@ function waitForVerdaccio(maxRetries = 30, interval = 1000) {
 }
 
 /**
- * 创建 npm 用户
+ * 创建 npm 用户 (使用 npm adduser 命令)
  */
 function createNpmUser(userInfo) {
     console.log(`正在创建用户: ${userInfo.username}...`);
 
-    const userData = {
-        _id: `org.couchdb.user:${userInfo.username}`,
-        name: userInfo.username,
-        password: userInfo.password,
-        email: userInfo.email,
-        type: 'user',
-        roles: [],
-        date: new Date().toISOString()
-    };
-
-    const postData = JSON.stringify(userData);
-
     return new Promise((resolve, reject) => {
-        const req = http.request({
-            hostname: 'localhost',
-            port: 4873,
-            path: `/-/user/org.couchdb.user:${userInfo.username}`,
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
+        const child = spawn('npm', ['adduser', '--registry', 'http://localhost:4873/'], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            shell: true
+        });
+
+        let output = '';
+        let errorOutput = '';
+
+        child.stdout.on('data', (data) => {
+            const str = data.toString();
+            output += str;
+
+            // 根据提示输入用户名、密码、邮箱
+            if (str.toLowerCase().includes('username')) {
+                child.stdin.write(userInfo.username + '\n');
+            } else if (str.toLowerCase().includes('password')) {
+                child.stdin.write(userInfo.password + '\n');
+            } else if (str.toLowerCase().includes('email')) {
+                child.stdin.write(userInfo.email + '\n');
             }
-        }, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                if (res.statusCode === 201 || res.statusCode === 200) {
-                    console.log(`用户 ${userInfo.username} 创建成功`);
-                    try {
-                        const result = JSON.parse(data);
-                        if (result.token) {
-                            userInfo.token = result.token;
-                        }
-                    } catch (e) {
-                        // 忽略解析错误
-                    }
-                    resolve(userInfo);
-                } else if (res.statusCode === 409) {
+        });
+
+        child.stderr.on('data', (data) => {
+            errorOutput += data.toString();
+        });
+
+        child.on('close', (code) => {
+            if (code === 0) {
+                console.log(`用户 ${userInfo.username} 创建成功`);
+                resolve(userInfo);
+            } else {
+                // 用户可能已存在
+                if (errorOutput.includes('already exists') || output.includes('already exists') || output.includes('Logged in')) {
                     console.log(`用户 ${userInfo.username} 已存在`);
                     resolve(userInfo);
                 } else {
-                    reject(new Error(`创建用户失败: ${res.statusCode} - ${data}`));
+                    console.error(`npm adduser 输出: ${output}`);
+                    console.error(`npm adduser 错误: ${errorOutput}`);
+                    reject(new Error(`创建用户失败: ${errorOutput || output}`));
                 }
-            });
+            }
         });
 
-        req.on('error', reject);
-        req.write(postData);
-        req.end();
+        child.on('error', (err) => {
+            reject(new Error(`执行 npm adduser 失败: ${err.message}`));
+        });
     });
 }
 
 /**
- * 使用项目级 .npmrc 配置认证信息
+ * 登录 npm 用户 (使用 npm login 命令)
  */
-function setupNpmrc() {
-    const env = loadEnv();
-    const username = env.NPM_USER || DEFAULT_USER.username;
-    const password = env.NPM_PASS || DEFAULT_USER.password;
-    const email = env.NPM_EMAIL || DEFAULT_USER.email;
+function loginNpmUser(userInfo) {
+    console.log(`正在登录用户: ${userInfo.username}...`);
 
-    // 创建 _auth (base64 编码的 username:password)
-    const auth = Buffer.from(`${username}:${password}`).toString('base64');
+    return new Promise((resolve, reject) => {
+        const child = spawn('npm', ['login', '--registry', 'http://localhost:4873/'], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            shell: true
+        });
 
-    // 在项目根目录创建 .npmrc
-    const npmrcPath = path.join(__dirname, '.npmrc');
-    const npmrcContent = `registry=http://localhost:4873/
-//localhost:4873/:_auth=${auth}
-//localhost:4873/:always-auth=true
-//localhost:4873/:email=${email}
-`;
-    fs.writeFileSync(npmrcPath, npmrcContent, 'utf8');
-    console.log(`已创建项目 .npmrc 文件: ${npmrcPath}`);
-    console.log(`用户 ${username} 认证信息已配置`);
-    return true;
+        let output = '';
+        let errorOutput = '';
+
+        child.stdout.on('data', (data) => {
+            const str = data.toString();
+            output += str;
+
+            // 根据提示输入用户名、密码、邮箱
+            if (str.toLowerCase().includes('username')) {
+                child.stdin.write(userInfo.username + '\n');
+            } else if (str.toLowerCase().includes('password')) {
+                child.stdin.write(userInfo.password + '\n');
+            } else if (str.toLowerCase().includes('email')) {
+                child.stdin.write(userInfo.email + '\n');
+            }
+        });
+
+        child.stderr.on('data', (data) => {
+            errorOutput += data.toString();
+        });
+
+        child.on('close', (code) => {
+            if (code === 0) {
+                console.log(`用户 ${userInfo.username} 登录成功`);
+                resolve(userInfo);
+            } else {
+                // 用户可能已登录
+                if (output.includes('Logged in') || errorOutput.includes('Logged in')) {
+                    console.log(`用户 ${userInfo.username} 已登录`);
+                    resolve(userInfo);
+                } else {
+                    console.error(`npm login 输出: ${output}`);
+                    console.error(`npm login 错误: ${errorOutput}`);
+                    reject(new Error(`登录失败: ${errorOutput || output}`));
+                }
+            }
+        });
+
+        child.on('error', (err) => {
+            reject(new Error(`执行 npm login 失败: ${err.message}`));
+        });
+    });
 }
 
 /**
- * 确保用户已创建并配置认证
+ * 确保用户已创建并登录
  */
 async function ensureAuthenticated() {
-    let env = loadEnv();
-
-    // 如果有用户信息，直接配置 npmrc
-    if (env.NPM_USER && env.NPM_PASS) {
-        console.log(`使用已存在的用户: ${env.NPM_USER}`);
-        setupNpmrc();
-        return env;
-    }
-
-    // 创建新用户
-    console.log('正在创建用户...');
-    const userInfo = await createNpmUser(DEFAULT_USER);
-    saveEnv(userInfo);
-
-    // 配置 npmrc
-    setupNpmrc();
+    // 先创建用户
+    console.log('正在创建用户:', DEFAULT_USER.username);
+    await createNpmUser(DEFAULT_USER);
+    
+    // 再登录用户
+    const userInfo = await loginNpmUser(DEFAULT_USER);
     return userInfo;
 }
 
@@ -273,7 +259,7 @@ function getPid() {
     return null;
 }
 
-function startVerdaccio() {
+async function startVerdaccio() {
     const existingPid = getPid();
     if (existingPid) {
         console.log(`Verdaccio 已经在运行中 (PID: ${existingPid})`);
@@ -288,21 +274,21 @@ WshShell.Run """${verdaccioBin.replace(/\\/g, '\\\\')}""" & " --config " & """${
         fs.writeFileSync(vbsScript, vbsContent);
 
         try {
-            execSync(`cscript //nologo "${vbsScript}"`, { 
+            execSync(`cscript //nologo "${vbsScript}"`, {
                 encoding: 'utf8',
-                windowsHide: true 
+                windowsHide: true
             });
-            
+
             // 等待一下让进程启动
             execSync('ping 127.0.0.1 -n 2 > nul', { shell: true, windowsHide: true });
-            
+
             // 通过 PowerShell 查找 verdaccio 进程的 PID
             const psCmd = `powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*verdaccio*' -and $_.CommandLine -like '*config.yaml*' } | Select-Object -First 1 -ExpandProperty ProcessId"`;
             const result = execSync(psCmd, {
                 encoding: 'utf8',
                 windowsHide: true
             }).trim();
-            
+
             if (result && !isNaN(parseInt(result, 10))) {
                 const pid = parseInt(result, 10);
                 fs.writeFileSync(pidFile, pid.toString());
@@ -312,17 +298,33 @@ WshShell.Run """${verdaccioBin.replace(/\\/g, '\\\\')}""" & " --config " & """${
                 console.log('Verdaccio 后台服务已启动（无法获取 PID）');
                 console.log(`访问地址: http://localhost:4873`);
             }
-            
+
             // 删除临时 VBS 文件
             fs.unlinkSync(vbsScript);
         } catch (e) {
             console.error('启动 Verdaccio 失败:', e.message);
             if (fs.existsSync(vbsScript)) fs.unlinkSync(vbsScript);
+            return;
         }
     }
 
-    // 启动静态文件服务器
-    startStaticServer();
+    // 等待 verdaccio 启动并进行用户认证
+    console.log('等待 Verdaccio 服务就绪...');
+    try {
+        await waitForVerdaccio(30, 1000);
+        console.log('Verdaccio 服务已就绪');
+    } catch (error) {
+        console.error('Verdaccio 启动超时:', error.message);
+        return;
+    }
+
+    // 确保用户已认证
+    try {
+        const authInfo = await ensureAuthenticated();
+        console.log(`已认证用户: ${authInfo.NPM_USER || authInfo.username}`);
+    } catch (error) {
+        console.error('用户认证失败:', error.message);
+    }
 }
 
 /**
@@ -584,7 +586,7 @@ function downloadFile(fileUrl, destPath, maxRedirects = 5) {
             });
 
             fileStream.on('error', (err) => {
-                fs.unlink(destPath, () => {});
+                fs.unlink(destPath, () => { });
                 reject(err);
             });
         });
@@ -692,23 +694,13 @@ async function runUpdate() {
     console.log('开始更新仓库并发布包...');
     console.log('========================================\n');
 
-    // 等待 verdaccio 启动
+    // 检查 verdaccio 是否运行
     console.log('检查 Verdaccio 服务状态...');
     try {
         await waitForVerdaccio(10, 1000);
         console.log('Verdaccio 服务已就绪');
     } catch (error) {
         console.error('Verdaccio 服务未运行，请先执行: node cli.js run');
-        return;
-    }
-
-    // 确保用户已认证
-    let authInfo;
-    try {
-        authInfo = await ensureAuthenticated();
-        console.log(`已认证用户: ${authInfo.NPM_USER || authInfo.username}`);
-    } catch (error) {
-        console.error('用户认证失败:', error.message);
         return;
     }
 
@@ -846,7 +838,12 @@ async function runUpdate() {
 // 主命令处理
 switch (command) {
     case 'run':
-        startVerdaccio();
+        // 启动Verdaccio
+        (async () => {
+            await startVerdaccio();
+            // 启动静态文件服务器
+            startStaticServer();
+        })();
         break;
     case 'update':
         runUpdate();
