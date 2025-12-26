@@ -844,7 +844,6 @@ async function runUpdate() {
 
                         if (pkgName && pkgVersion) {
                             // 先尝试移除已存在的版本
-                            console.log(`>>> remove: ${pkgName}@${pkgVersion}`);
                             runCommand(
                                 `npm unpublish ${pkgName}@${pkgVersion} --registry http://localhost:4873 --force`,
                                 itemPath,
