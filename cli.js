@@ -6,12 +6,15 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 
+const crypto = require('crypto');
+
 const verdaccioBin = path.join(__dirname, 'node_modules', '.bin', 'verdaccio.cmd');
 const configPath = path.join(__dirname, 'config.yaml');
 const pidFile = path.join(__dirname, '.verdaccio.pid');
 const staticPidFile = path.join(__dirname, '.static-server.pid');
 const reposDir = path.join(__dirname, 'repos');
 const publicDir = path.join(__dirname, 'public');
+const npmrcPath = path.join(__dirname, '.npmrc');
 const STATIC_SERVER_PORT = 4874;
 
 // Cloudflare R2 配置
@@ -72,162 +75,146 @@ function waitForVerdaccio(maxRetries = 30, interval = 1000) {
 }
 
 /**
- * 使用 npm-cli-login 创建用户（非交互式）
+ * 直接通过 htpasswd 文件创建用户（备用方案）
+ * 这种方式不依赖 npm adduser 的交互式输入
  */
-function createNpmUser(userInfo) {
-    console.log(`正在创建/登录用户: ${userInfo.username}...`);
-
-    return new Promise((resolve, reject) => {
-        // 设置超时
-        const timeout = setTimeout(() => {
-            child.kill();
-            reject(new Error('npm adduser 超时'));
-        }, 30000);
-
-        const child = spawn('npm', [
-            'adduser',
-            '--registry', 'http://localhost:4873/',
-            '--auth-type=legacy'
-        ], {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            shell: true,
-            env: { ...process.env }
-        });
-
-        let output = '';
-        let errorOutput = '';
-        let usernameWritten = false;
-        let passwordWritten = false;
-        let emailWritten = false;
-
-        child.stdout.on('data', (data) => {
-            const str = data.toString();
-            output += str;
-            // console.log('npm output:', str);
-
-            // 根据提示输入用户名、密码、邮箱
-            const lowerStr = str.toLowerCase();
-            if (lowerStr.includes('username') && !usernameWritten) {
-                console.log('写入用户名...');
-                child.stdin.write(userInfo.username + '\n');
-                usernameWritten = true;
-            } else if (lowerStr.includes('password') && !passwordWritten) {
-                console.log('写入密码...');
-                child.stdin.write(userInfo.password + '\n');
-                passwordWritten = true;
-            } else if (lowerStr.includes('email') && !emailWritten) {
-                console.log('写入邮箱...');
-                child.stdin.write(userInfo.email + '\n');
-                emailWritten = true;
-            }
-        });
-
-        child.stderr.on('data', (data) => {
-            const str = data.toString();
-            errorOutput += str;
-            console.log('npm stderr:', str);
-        });
-
-        child.on('close', (code) => {
-            clearTimeout(timeout);
-            const allOutput = output + errorOutput;
-            const lowerOutput = allOutput.toLowerCase();
-
-            // 检查是否成功或用户已存在
-            if (code === 0 ||
-                lowerOutput.includes('logged in') ||
-                lowerOutput.includes('already exists') ||
-                lowerOutput.includes('already registered')) {
-                console.log(`用户 ${userInfo.username} 已就绪（创建成功或已存在）`);
-                resolve(userInfo);
-            } else {
-                console.error(`npm adduser 输出: ${output}`);
-                console.error(`npm adduser 错误: ${errorOutput}`);
-                reject(new Error(`创建用户失败: ${errorOutput || output}`));
-            }
-        });
-
-        child.on('error', (err) => {
-            clearTimeout(timeout);
-            reject(new Error(`执行 npm adduser 失败: ${err.message}`));
-        });
-    });
-}
-
-/**
- * 登录 npm 用户 (使用 npm login 命令)
- */
-function loginNpmUser(userInfo) {
-    console.log(`正在登录用户: ${userInfo.username}...`);
-
-    return new Promise((resolve, reject) => {
-        const child = spawn('npm', ['login', '--registry', 'http://localhost:4873/'], {
-            stdio: ['pipe', 'pipe', 'pipe'],
-            shell: true
-        });
-
-        let output = '';
-        let errorOutput = '';
-
-        child.stdout.on('data', (data) => {
-            const str = data.toString();
-            output += str;
-
-            // 根据提示输入用户名、密码、邮箱
-            if (str.toLowerCase().includes('username')) {
-                child.stdin.write(userInfo.username + '\n');
-            } else if (str.toLowerCase().includes('password')) {
-                child.stdin.write(userInfo.password + '\n');
-            } else if (str.toLowerCase().includes('email')) {
-                child.stdin.write(userInfo.email + '\n');
-            }
-        });
-
-        child.stderr.on('data', (data) => {
-            errorOutput += data.toString();
-        });
-
-        child.on('close', (code) => {
-            if (code === 0) {
-                console.log(`用户 ${userInfo.username} 登录成功`);
-                resolve(userInfo);
-            } else {
-                // 用户可能已登录
-                if (output.includes('Logged in') || errorOutput.includes('Logged in')) {
-                    console.log(`用户 ${userInfo.username} 已登录`);
-                    resolve(userInfo);
-                } else {
-                    console.error(`npm login 输出: ${output}`);
-                    console.error(`npm login 错误: ${errorOutput}`);
-                    reject(new Error(`登录失败: ${errorOutput || output}`));
-                }
-            }
-        });
-
-        child.on('error', (err) => {
-            reject(new Error(`执行 npm login 失败: ${err.message}`));
-        });
-    });
-}
-
-/**
- * 确保用户已创建并登录
- */
-async function ensureAuthenticated() {
-
-    // 先尝试创建用户（如果已存在会自动处理）
-    console.log('正在确保用户存在:', DEFAULT_USER.username);
-    await createNpmUser(DEFAULT_USER);
-    console.log(`用户 ${DEFAULT_USER.username} 认证完成`);
-    // 如果创建失败，尝试登录
-    console.log('尝试登录...');
+function createUserViaHtpasswd(userInfo) {
+    // 注意：config.yaml 中配置的是 ./htpasswd，即项目根目录
+    const htpasswdPath = path.join(__dirname, 'htpasswd');
+    
+    console.log(`尝试通过 htpasswd 文件创建用户: ${userInfo.username}`);
+    console.log(`htpasswd 文件路径: ${htpasswdPath}`);
+    
+    // 生成 bcrypt 风格的密码哈希（Verdaccio 使用的格式）
+    // 使用 Apache 的 SHA1 格式: {SHA}base64(sha1(password))
+    const sha1Hash = crypto.createHash('sha1').update(userInfo.password).digest('base64');
+    const passwordHash = `{SHA}${sha1Hash}`;
+    
+    const userLine = `${userInfo.username}:${passwordHash}:autocreated ${new Date().toISOString()}`;
+    
     try {
-        const userInfo = await loginNpmUser(DEFAULT_USER);
-        return userInfo;
-    } catch (loginError) {
-        console.error('登录也失败，认证失败');
-        throw loginError;
+        // 读取现有的 htpasswd 文件
+        let existingContent = '';
+        if (fs.existsSync(htpasswdPath)) {
+            existingContent = fs.readFileSync(htpasswdPath, 'utf8');
+            
+            // 检查用户是否已存在
+            const lines = existingContent.split('\n');
+            const userExists = lines.some(line => line.startsWith(userInfo.username + ':'));
+            
+            if (userExists) {
+                console.log(`用户 ${userInfo.username} 已存在于 htpasswd 文件中`);
+                return true;
+            }
+        }
+        
+        // 添加新用户
+        const newContent = existingContent ? existingContent.trim() + '\n' + userLine + '\n' : userLine + '\n';
+        fs.writeFileSync(htpasswdPath, newContent, 'utf8');
+        console.log(`用户 ${userInfo.username} 已通过 htpasswd 创建成功`);
+        return true;
+    } catch (error) {
+        console.error(`通过 htpasswd 创建用户失败: ${error.message}`);
+        return false;
     }
+}
+
+/**
+ * 确保用户已创建
+ */
+function ensureAuthenticated() {
+    console.log('通过 htpasswd 文件创建用户...');
+    const success = createUserViaHtpasswd(DEFAULT_USER);
+    
+    if (success) {
+        console.log(`用户 ${DEFAULT_USER.username} 已就绪`);
+        return DEFAULT_USER;
+    } else {
+        throw new Error('创建用户失败');
+    }
+}
+
+/**
+ * 创建本地 .npmrc 配置文件
+ * 配置 registry、认证 token 和禁用代理
+ */
+function createLocalNpmrc() {
+    return new Promise((resolve, reject) => {
+        console.log('创建本地 .npmrc 配置文件...');
+        
+        // 通过 Verdaccio API 登录获取真正的 token
+        const postData = JSON.stringify({
+            name: DEFAULT_USER.username,
+            password: DEFAULT_USER.password
+        });
+
+        // 生成 Basic Auth 头
+        const basicAuth = Buffer.from(`${DEFAULT_USER.username}:${DEFAULT_USER.password}`).toString('base64');
+        
+        const req = http.request({
+            hostname: 'localhost',
+            port: 4873,
+            path: '/-/user/org.couchdb.user:' + DEFAULT_USER.username,
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData),
+                'Authorization': 'Basic ' + basicAuth
+            }
+        }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const result = JSON.parse(data);
+                    const token = result.token;
+                    
+                    if (!token) {
+                        // 如果没有获取到 token，使用 Basic Auth 方式
+                        console.log('使用 Basic Auth 认证方式...');
+                        const npmrcContent = `# 本地 Verdaccio 配置（由 cli.js 自动生成）
+registry=http://localhost:4873/
+//localhost:4873/:_auth=${basicAuth}
+//localhost:4873/:username=${DEFAULT_USER.username}
+//localhost:4873/:_password=${Buffer.from(DEFAULT_USER.password).toString('base64')}
+# 禁用代理以避免 localhost 请求走代理导致 502 错误
+proxy=null
+https-proxy=null
+noproxy=localhost,127.0.0.1
+`;
+                        fs.writeFileSync(npmrcPath, npmrcContent, 'utf8');
+                        console.log(`本地 .npmrc 已创建 (Basic Auth): ${npmrcPath}`);
+                        resolve(true);
+                        return;
+                    }
+                    
+                    const npmrcContent = `# 本地 Verdaccio 配置（由 cli.js 自动生成）
+registry=http://localhost:4873/
+//localhost:4873/:_authToken=${token}
+# 禁用代理以避免 localhost 请求走代理导致 502 错误
+proxy=null
+https-proxy=null
+noproxy=localhost,127.0.0.1
+`;
+                    
+                    fs.writeFileSync(npmrcPath, npmrcContent, 'utf8');
+                    console.log(`本地 .npmrc 已创建: ${npmrcPath}`);
+                    resolve(true);
+                } catch (error) {
+                    console.error(`解析响应失败: ${error.message}`);
+                    reject(error);
+                }
+            });
+        });
+        
+        req.on('error', (error) => {
+            console.error(`请求失败: ${error.message}`);
+            reject(error);
+        });
+        
+        req.write(postData);
+        req.end();
+    });
 }
 
 const REPOS = [
@@ -366,12 +353,15 @@ WshShell.Run """${verdaccioBin.replace(/\\/g, '\\\\')}""" & " --config " & """${
         return;
     }
 
-    // 确保用户已认证
+    // 确保用户已创建
     try {
-        const authInfo = await ensureAuthenticated();
-        console.log(`已认证用户: ${authInfo.NPM_USER || authInfo.username}`);
+        const authInfo = ensureAuthenticated();
+        console.log(`已创建用户: ${authInfo.username}`);
+        
+        // 创建本地 .npmrc 配置文件
+        await createLocalNpmrc();
     } catch (error) {
-        console.error('用户认证失败:', error.message);
+        console.error('用户创建或配置失败:', error.message);
     }
 }
 
@@ -752,6 +742,16 @@ async function runUpdate(forceUpdate = false) {
         return;
     }
 
+    // 确保认证已设置
+    try {
+        ensureAuthenticated();
+        await createLocalNpmrc();
+        console.log('认证配置已就绪');
+    } catch (error) {
+        console.error('认证配置失败:', error.message);
+        return;
+    }
+
     // 创建 repos 目录
     if (!fs.existsSync(reposDir)) {
         fs.mkdirSync(reposDir, { recursive: true });
@@ -875,18 +875,18 @@ async function runUpdate(forceUpdate = false) {
                                 if (forceUpdate) {
                                     // 强制更新模式：先移除再发布
                                     runCommand(
-                                        `npm unpublish ${pkgName}@${pkgVersion} --registry http://localhost:4873 --force`,
+                                        `npm unpublish ${pkgName}@${pkgVersion} --registry http://localhost:4873 --userconfig "${npmrcPath}" --force`,
                                         itemPath,
                                         `移除 ${pkgName}@${pkgVersion}`
                                     );
-                                    runCommand('npm publish --registry http://localhost:4873', itemPath, `发布 ${item}`);
+                                    runCommand(`npm publish --registry http://localhost:4873 --userconfig "${npmrcPath}"`, itemPath, `发布 ${item}`);
                                 } else {
                                     // 非强制更新模式：跳过已存在的包
                                     console.log(`包 ${pkgName}@${pkgVersion} 已存在，跳过发布`);
                                 }
                             } else {
                                 // 包不存在，直接发布
-                                runCommand('npm publish --registry http://localhost:4873', itemPath, `发布 ${item}`);
+                                runCommand(`npm publish --registry http://localhost:4873 --userconfig "${npmrcPath}"`, itemPath, `发布 ${item}`);
                             }
                         } else {
                             // 无法获取包名或版本，直接尝试发布
@@ -894,7 +894,7 @@ async function runUpdate(forceUpdate = false) {
                         }
                     } catch (e) {
                         console.log(`读取 package.json 失败: ${e.message}，尝试直接发布`);
-                        runCommand('npm publish --registry http://localhost:4873', itemPath, `发布 ${item}`);
+                        runCommand(`npm publish --registry http://localhost:4873 --userconfig "${npmrcPath}"`, itemPath, `发布 ${item}`);
                     }
                 }
             }
