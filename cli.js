@@ -31,7 +31,6 @@ const DEFAULT_USER = {
     email: 'admin@aily.local'
 };
 
-
 /**
  * 等待 verdaccio 启动
  */
@@ -586,9 +585,23 @@ function runCommand(cmd, cwd, description) {
 }
 
 /**
- * 下载文件（支持重定向）
+ * 格式化文件大小
  */
-function downloadFile(fileUrl, destPath, maxRedirects = 5) {
+function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+/**
+ * 下载文件（支持重定向，带进度显示）
+ * @param {string} fileUrl - 下载 URL
+ * @param {string} destPath - 目标路径
+ * @param {number} maxRedirects - 最大重定向次数
+ * @param {boolean} isRedirect - 是否为重定向调用（内部使用）
+ */
+function downloadFile(fileUrl, destPath, maxRedirects = 5, isRedirect = false) {
     return new Promise((resolve, reject) => {
         if (maxRedirects <= 0) {
             reject(new Error('重定向次数过多'));
@@ -596,44 +609,77 @@ function downloadFile(fileUrl, destPath, maxRedirects = 5) {
         }
 
         const protocol = fileUrl.startsWith('https') ? https : http;
-        console.log(`正在下载: ${fileUrl}`);
+        // 从 URL 中提取文件名用于显示
+        const fileName = path.basename(destPath);
+        
+        // 只在首次调用时输出初始进度
+        if (!isRedirect) {
+            process.stdout.write(`正在下载: ${fileName}...`);
+        }
 
         const request = protocol.get(fileUrl, (response) => {
             // 处理重定向
             if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                console.log(`重定向到: ${response.headers.location}`);
-                downloadFile(response.headers.location, destPath, maxRedirects - 1)
+                // 递归调用，标记为重定向
+                downloadFile(response.headers.location, destPath, maxRedirects - 1, true)
                     .then(resolve)
                     .catch(reject);
                 return;
             }
 
             if (response.statusCode !== 200) {
+                process.stdout.write('\n');
                 reject(new Error(`下载失败: HTTP ${response.statusCode}`));
                 return;
             }
 
+            const totalSize = parseInt(response.headers['content-length'], 10) || 0;
+            let downloadedSize = 0;
+            let lastDisplay = '';
+
             const fileStream = fs.createWriteStream(destPath);
+
+            response.on('data', (chunk) => {
+                downloadedSize += chunk.length;
+                let displayText;
+                if (totalSize > 0) {
+                    // 有 content-length，显示百分比
+                    const percent = Math.round((downloadedSize / totalSize) * 100);
+                    displayText = `正在下载: ${fileName}... ${percent}% (${formatSize(downloadedSize)}/${formatSize(totalSize)})`;
+                } else {
+                    // 没有 content-length（如 GitHub），显示已下载大小
+                    displayText = `正在下载: ${fileName}... ${formatSize(downloadedSize)}`;
+                }
+                if (displayText !== lastDisplay) {
+                    lastDisplay = displayText;
+                    // 添加足够的空格覆盖之前可能更长的内容
+                    process.stdout.write(`\r${displayText}` + ' '.repeat(20));
+                }
+            });
+
             response.pipe(fileStream);
 
             fileStream.on('finish', () => {
                 fileStream.close();
-                console.log(`下载完成: ${destPath}`);
+                process.stdout.write(`\r下载完成: ${fileName} (${formatSize(downloadedSize)})` + ' '.repeat(30) + '\n');
                 resolve(destPath);
             });
 
             fileStream.on('error', (err) => {
+                process.stdout.write('\n');
                 fs.unlink(destPath, () => { });
                 reject(err);
             });
         });
 
         request.on('error', (err) => {
+            process.stdout.write('\n');
             reject(err);
         });
 
         request.setTimeout(60000, () => {
             request.destroy();
+            process.stdout.write('\n');
             reject(new Error('下载超时'));
         });
     });
@@ -664,66 +710,88 @@ function extractZip(zipPath, destDir) {
 
 /**
  * 从 GitHub 下载 zip 并解压到指定目录
+ * @param {Object} repo - 仓库配置
+ * @param {string} reposDir - 仓库目录
+ * @param {number} maxRetries - 最大重试次数
  */
-async function downloadAndExtractRepo(repo, reposDir) {
+async function downloadAndExtractRepo(repo, reposDir, maxRetries = 3) {
     const repoPath = path.join(reposDir, repo.name);
     const zipPath = path.join(reposDir, `${repo.name}.zip`);
     const tempExtractDir = path.join(reposDir, `${repo.name}-temp`);
 
-    try {
-        // 1. 下载 zip 文件
-        await downloadFile(repo.github, zipPath);
-
-        // 2. 删除旧的仓库目录（如果存在）
-        if (fs.existsSync(repoPath)) {
-            console.log(`删除旧目录: ${repoPath}`);
-            fs.rmSync(repoPath, { recursive: true, force: true });
-        }
-
-        // 3. 删除临时解压目录（如果存在）
-        if (fs.existsSync(tempExtractDir)) {
-            fs.rmSync(tempExtractDir, { recursive: true, force: true });
-        }
-
-        // 4. 解压到临时目录
-        await extractZip(zipPath, tempExtractDir);
-
-        // 5. GitHub zip 包解压后会有一个 repo-name-branch 格式的子目录，需要移动到正确位置
-        const extractedItems = fs.readdirSync(tempExtractDir);
-        if (extractedItems.length === 1) {
-            const extractedDir = path.join(tempExtractDir, extractedItems[0]);
-            const stat = fs.statSync(extractedDir);
-            if (stat.isDirectory()) {
-                // 移动解压后的目录到目标位置
-                fs.renameSync(extractedDir, repoPath);
-                console.log(`已移动: ${extractedDir} -> ${repoPath}`);
+    let lastError = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            if (attempt > 1) {
+                console.log(`第 ${attempt}/${maxRetries} 次重试下载: ${repo.name}`);
             }
-        } else {
-            // 如果不是单个目录，直接重命名临时目录
-            fs.renameSync(tempExtractDir, repoPath);
-        }
+            
+            // 1. 下载 zip 文件
+            await downloadFile(repo.github, zipPath);
 
-        // 6. 清理临时目录和 zip 文件
-        if (fs.existsSync(tempExtractDir)) {
-            fs.rmSync(tempExtractDir, { recursive: true, force: true });
-        }
-        if (fs.existsSync(zipPath)) {
-            fs.unlinkSync(zipPath);
-            console.log(`已删除 zip 文件: ${zipPath}`);
-        }
+            // 2. 删除旧的仓库目录（如果存在）
+            if (fs.existsSync(repoPath)) {
+                console.log(`删除旧目录: ${repoPath}`);
+                fs.rmSync(repoPath, { recursive: true, force: true });
+            }
 
-        return true;
-    } catch (error) {
-        console.error(`下载或解压仓库失败: ${error.message}`);
-        // 清理可能存在的临时文件
-        if (fs.existsSync(zipPath)) {
-            fs.unlinkSync(zipPath);
+            // 3. 删除临时解压目录（如果存在）
+            if (fs.existsSync(tempExtractDir)) {
+                fs.rmSync(tempExtractDir, { recursive: true, force: true });
+            }
+
+            // 4. 解压到临时目录
+            await extractZip(zipPath, tempExtractDir);
+
+            // 5. GitHub zip 包解压后会有一个 repo-name-branch 格式的子目录，需要移动到正确位置
+            const extractedItems = fs.readdirSync(tempExtractDir);
+            if (extractedItems.length === 1) {
+                const extractedDir = path.join(tempExtractDir, extractedItems[0]);
+                const stat = fs.statSync(extractedDir);
+                if (stat.isDirectory()) {
+                    // 移动解压后的目录到目标位置
+                    fs.renameSync(extractedDir, repoPath);
+                    console.log(`已移动: ${extractedDir} -> ${repoPath}`);
+                }
+            } else {
+                // 如果不是单个目录，直接重命名临时目录
+                fs.renameSync(tempExtractDir, repoPath);
+            }
+
+            // 6. 清理临时目录和 zip 文件
+            if (fs.existsSync(tempExtractDir)) {
+                fs.rmSync(tempExtractDir, { recursive: true, force: true });
+            }
+            if (fs.existsSync(zipPath)) {
+                fs.unlinkSync(zipPath);
+                console.log(`已删除 zip 文件: ${zipPath}`);
+            }
+
+            return true;
+        } catch (error) {
+            lastError = error;
+            console.error(`下载或解压仓库失败 (第 ${attempt}/${maxRetries} 次): ${error.message}`);
+            
+            // 清理可能存在的临时文件
+            if (fs.existsSync(zipPath)) {
+                try { fs.unlinkSync(zipPath); } catch (e) { }
+            }
+            if (fs.existsSync(tempExtractDir)) {
+                try { fs.rmSync(tempExtractDir, { recursive: true, force: true }); } catch (e) { }
+            }
+            
+            // 如果还有重试机会，等待一段时间后再重试
+            if (attempt < maxRetries) {
+                const waitTime = attempt * 2000; // 递增等待时间：2秒、4秒
+                console.log(`等待 ${waitTime / 1000} 秒后重试...`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
         }
-        if (fs.existsSync(tempExtractDir)) {
-            fs.rmSync(tempExtractDir, { recursive: true, force: true });
-        }
-        return false;
     }
+    
+    console.error(`仓库 ${repo.name} 下载失败，已重试 ${maxRetries} 次: ${lastError?.message}`);
+    return false;
 }
 
 async function runUpdate(forceUpdate = false) {
@@ -984,8 +1052,12 @@ async function fetchManifest(baseUrl, manifestFile) {
 
 /**
  * 下载单个文件到指定路径
+ * @param {string} fileUrl - 文件 URL
+ * @param {string} destPath - 目标路径
+ * @param {function} onProgress - 进度回调函数 (downloaded, total, percent)
+ * @param {number} maxRedirects - 最大重定向次数
  */
-function downloadFileToPath(fileUrl, destPath, maxRedirects = 5) {
+function downloadFileToPath(fileUrl, destPath, onProgress = null, maxRedirects = 5) {
     return new Promise((resolve, reject) => {
         if (maxRedirects <= 0) {
             reject(new Error('重定向次数过多'));
@@ -1003,7 +1075,7 @@ function downloadFileToPath(fileUrl, destPath, maxRedirects = 5) {
         const request = protocol.get(fileUrl, (response) => {
             // 处理重定向
             if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                downloadFileToPath(response.headers.location, destPath, maxRedirects - 1)
+                downloadFileToPath(response.headers.location, destPath, onProgress, maxRedirects - 1)
                     .then(resolve)
                     .catch(reject);
                 return;
@@ -1014,7 +1086,19 @@ function downloadFileToPath(fileUrl, destPath, maxRedirects = 5) {
                 return;
             }
 
+            const totalSize = parseInt(response.headers['content-length'], 10) || 0;
+            let downloadedSize = 0;
+
             const fileStream = fs.createWriteStream(destPath);
+
+            response.on('data', (chunk) => {
+                downloadedSize += chunk.length;
+                if (onProgress && totalSize > 0) {
+                    const percent = Math.round((downloadedSize / totalSize) * 100);
+                    onProgress(downloadedSize, totalSize, percent);
+                }
+            });
+
             response.pipe(fileStream);
 
             fileStream.on('finish', () => {
@@ -1080,17 +1164,29 @@ async function runSync(forceUpdate = false) {
 
             // 检查文件是否已存在（非强制更新模式）
             if (!forceUpdate && fs.existsSync(destPath)) {
-                console.log(`${progress} - ${fileKey} (已存在，跳过)`);
+                console.log(`${progress} 跳过 (已存在): ${fileKey}`);
                 skipCount++;
                 continue;
             }
             
             try {
-                await downloadFileToPath(fileUrl, destPath);
-                console.log(`${progress} ✓ ${fileKey}`);
+                // 进度回调函数，用于显示下载百分比
+                let lastPercent = -1;
+                const onProgress = (downloaded, total, percent) => {
+                    if (percent !== lastPercent) {
+                        lastPercent = percent;
+                        // 使用 \r 回到行首，覆盖之前的进度
+                        process.stdout.write(`\r${progress} 正在下载: ${fileKey}... ${percent}%`);
+                    }
+                };
+                
+                process.stdout.write(`${progress} 正在下载: ${fileKey}... 0%`);
+                await downloadFileToPath(fileUrl, destPath, onProgress);
+                // 清除当前行并显示完成信息
+                process.stdout.write(`\r${progress} ✓ ${fileKey}` + ' '.repeat(20) + '\n');
                 successCount++;
             } catch (error) {
-                console.error(`${progress} ✗ ${fileKey}: ${error.message}`);
+                process.stdout.write(`\r${progress} ✗ ${fileKey}: ${error.message}` + ' '.repeat(20) + '\n');
                 failCount++;
             }
         }

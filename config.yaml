@@ -1,6 +1,10 @@
 storage: ./storage
 listen:
   - 0.0.0.0:4873
+
+# 增加最大包大小限制（默认是 10mb，这里设置为 300mb）
+max_body_size: 300mb
+
 auth:
   htpasswd:
     file: ./htpasswd
